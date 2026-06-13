@@ -12,7 +12,10 @@ Tools:
     create_fit_card(outfit, new_item)               → str
 """
 
+from __future__ import annotations
+
 import os
+import re
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -20,6 +23,84 @@ from groq import Groq
 from utils.data_loader import load_listings
 
 load_dotenv()
+
+
+# ── Keyword scoring helpers ─────────────────────────────────────────────────────
+
+# Common words that carry no search signal — dropped before scoring so a query
+# like "a vintage tee for the summer" matches on "vintage", "tee", "summer".
+_STOPWORDS = {
+    "a", "an", "the", "and", "or", "for", "with", "to", "of", "in", "on",
+    "my", "i", "im", "me", "some", "any", "that", "this", "looking", "want",
+    "need", "find", "something", "really", "very", "kind", "sort", "would",
+    "like", "love", "wear", "wearing",
+}
+
+
+def _tokenize(text: str) -> list[str]:
+    """Lowercase a string and split it into alphanumeric word tokens."""
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+
+def _keywords(description: str) -> list[str]:
+    """Extract meaningful, de-duplicated search keywords from a description."""
+    seen = []
+    for tok in _tokenize(description):
+        if tok in _STOPWORDS:
+            continue
+        if tok not in seen:
+            seen.append(tok)
+    return seen
+
+
+def _size_matches(query_size: str, listing_size: str) -> bool:
+    """
+    Case-insensitive size match.
+
+    A listing matches if the requested size appears as one of the tokens in the
+    listing's size string, so "M" matches "S/M", "M/L", and "M" but not "Medium"
+    spelled out or an unrelated size like "L".
+    """
+    query_tokens = set(_tokenize(query_size))
+    if not query_tokens:
+        return True  # blank/garbage size filter → don't exclude anything
+    listing_tokens = set(_tokenize(listing_size))
+    return bool(query_tokens & listing_tokens)
+
+
+def _score_listing(keywords: list[str], listing: dict) -> int:
+    """
+    Score a listing by how many query keywords overlap with its text fields.
+
+    style_tags and the title are the strongest relevance signals, so a hit there
+    is weighted more heavily than a hit in the free-text description.
+    """
+    title_tokens = set(_tokenize(listing.get("title", "")))
+    desc_tokens = set(_tokenize(listing.get("description", "")))
+    category_tokens = set(_tokenize(listing.get("category", "")))
+    brand_tokens = set(_tokenize(listing.get("brand") or ""))
+    tag_tokens = set()
+    for tag in listing.get("style_tags", []):
+        tag_tokens |= set(_tokenize(tag))
+    color_tokens = set()
+    for color in listing.get("colors", []):
+        color_tokens |= set(_tokenize(color))
+
+    score = 0
+    for kw in keywords:
+        if kw in tag_tokens:
+            score += 3
+        if kw in title_tokens:
+            score += 3
+        if kw in color_tokens:
+            score += 2
+        if kw in category_tokens:
+            score += 2
+        if kw in brand_tokens:
+            score += 2
+        if kw in desc_tokens:
+            score += 1
+    return score
 
 
 # ── Groq client ───────────────────────────────────────────────────────────────
@@ -69,8 +150,34 @@ def search_listings(
 
     Before writing code, fill in the Tool 1 section of planning.md.
     """
-    # Replace this with your implementation
-    return []
+    # 1. Load all listings.
+    listings = load_listings()
+
+    # 2. Filter by max_price and size (when those filters are provided).
+    candidates = []
+    for listing in listings:
+        if max_price is not None and listing.get("price", 0) > max_price:
+            continue
+        if size is not None and not _size_matches(size, listing.get("size", "")):
+            continue
+        candidates.append(listing)
+
+    # 3. Score each remaining listing by keyword overlap with the description.
+    keywords = _keywords(description)
+    scored = [(listing, _score_listing(keywords, listing)) for listing in candidates]
+
+    # 4. Drop any listings with a score of 0 (no relevant matches).
+    #    If the description had no usable keywords at all, fall back to returning
+    #    everything that passed the size/price filters rather than nothing.
+    if keywords:
+        scored = [(listing, score) for listing, score in scored if score > 0]
+    else:
+        scored = [(listing, 0) for listing, _ in scored]
+
+    # 5. Sort by score, highest first, and return just the listing dicts.
+    #    Python's sort is stable, so ties keep the dataset's original ordering.
+    scored.sort(key=lambda pair: pair[1], reverse=True)
+    return [listing for listing, _ in scored]
 
 
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────

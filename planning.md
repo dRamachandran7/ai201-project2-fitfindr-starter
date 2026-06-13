@@ -87,14 +87,37 @@ If `outfit` is empty or whitespace-only, it returns a descriptive error message 
 ## Planning Loop
 
 **How does your agent decide which tool to call next?**
-<!-- Describe the logic your planning loop uses. What does it look at? What conditions change its behavior? How does it know when it's done? -->
+
+After each step, the agent checks that it has the information it needs before moving to the next tool — it reacts to what came back rather than running a fixed sequence.
+
+- After **search_listings**: if the result list is empty, there is nothing to style, so the agent stops, records a helpful error in the session, and skips the remaining tools. It only proceeds to select a top item and continue when the list is non-empty.
+- Before **suggest_outfit**: the agent confirms a `selected_item` exists. An empty *wardrobe* does **not** stop the loop and is **not** a reason to call another tool — `suggest_outfit` handles that case itself by returning general styling advice for the item alone.
+- Before **create_fit_card**: the agent confirms a non-empty `outfit_suggestion` exists; if not, the fit card is skipped.
+
+The loop knows it is **done** when `fit_card` is populated (success) or when `error` is set (early exit).
 
 ---
 
 ## State Management
 
 **How does information from one tool get passed to the next?**
-<!-- Describe how your agent stores and accesses state within a session. What data is tracked? How is it passed between tool calls? -->
+
+All state for a single interaction lives in one **`session` dict**, created by `_new_session(query, wardrobe)` at the start of `run_agent`. It is the single source of truth — each step reads from it and writes its output back into it, so no tool re-derives or re-asks for data an earlier step already produced.
+
+The session tracks:
+
+| Field | Written by | Read by |
+|-------|-----------|---------|
+| `query` | initial input | parsing step |
+| `parsed` (`description`, `size`, `max_price`) | parsing step | `search_listings` |
+| `search_results` (list) | `search_listings` | item-selection step |
+| `selected_item` (top listing dict) | item-selection step | `suggest_outfit`, `create_fit_card` |
+| `wardrobe` | initial input | `suggest_outfit` |
+| `outfit_suggestion` (str) | `suggest_outfit` | `create_fit_card` |
+| `fit_card` (str) | `create_fit_card` | final output |
+| `error` | any step that exits early | planning loop (gate) + final output |
+
+The key handoff: the item found by `search_listings` is stored once in `session["selected_item"]` and flows into both `suggest_outfit` and `create_fit_card` automatically — the user never re-enters it. `run_agent` returns the completed `session` dict, and the caller checks `session["error"]` first (if set, `outfit_suggestion` and `fit_card` will be `None`).
 
 ---
 
@@ -104,9 +127,9 @@ For each tool, describe the specific failure mode you're handling and what the a
 
 | Tool | Failure mode | Agent response |
 |------|-------------|----------------|
-| search_listings | No results match the query | |
-| suggest_outfit | Wardrobe is empty | |
-| create_fit_card | Outfit input is missing or incomplete | |
+| search_listings | No listings match the description/size/price | Returns an empty list (never raises). The planning loop detects this, writes a helpful message to `session["error"]` (e.g. "No matches under $30 — try raising your budget or loosening the description"), and stops without calling the downstream tools. |
+| suggest_outfit | Wardrobe is empty (`wardrobe['items'] == []`) | Does not crash or loop back to search. Falls back to general styling advice for the new item on its own and returns a non-empty string. (A genuine LLM/API error bubbles up so the loop can stop and inform the user.) |
+| create_fit_card | `outfit` string is missing, empty, or whitespace-only | Returns a descriptive error message string instead of raising or silently returning "". The planning loop also guards against this by only calling the tool when `outfit_suggestion` is non-empty. |
 
 ---
 
@@ -121,6 +144,51 @@ For each tool, describe the specific failure mode you're handling and what the a
      sketch are all fine. You'll share this diagram with an AI tool when asking it to implement
      the planning loop and each individual tool. -->
 
+```
+User query + wardrobe
+    │
+    ▼
+Planning Loop ──────────────────────────────────────────────────┐
+    │                                                            │
+    ├─► parse query                                              │
+    │       │  Session: parsed = {description, size, max_price}  │
+    │       ▼                                                    │
+    ├─► search_listings(description, size, max_price)            │
+    │       │ results=[]                                         │
+    │       ├──► [ERROR] "No listings found, try a broader query"│
+    │       │                                          → return ─┤
+    │       │ results=[item, ...]                                │
+    │       ▼                                                    │
+    │   Session: search_results = [...]                          │
+    │   Session: selected_item   = results[0]   ◄── gate: only   │
+    │       │                                       if non-empty │
+    │       ▼                                                    │
+    ├─► suggest_outfit(selected_item, wardrobe)                  │
+    │       │ wardrobe['items']==[] ─► general styling advice    │
+    │       │ wardrobe has items    ─► outfit from real pieces   │
+    │       │ (LLM/API error) ──► [ERROR] → return ──────────────┤
+    │       ▼                                                    │
+    │   Session: outfit_suggestion = "..."   ◄── gate: only      │
+    │       │                                    if non-empty    │
+    │       ▼                                                    │
+    └─► create_fit_card(outfit_suggestion, selected_item)        │
+            │ outfit empty/missing ─► descriptive error string   │
+            │ outfit present       ─► fresh caption (temp↑)      │
+            ▼                                                    │
+        Session: fit_card = "..."                                │
+            │                                  error path returns ┘
+            ▼                                          │
+    ┌───────────────┐                      ┌───────────────────┐
+    │ error is None │                      │ error is set      │
+    │ success path  │                      │ early-exit path   │
+    └───────┬───────┘                      └─────────┬─────────┘
+            ▼                                        ▼
+    Return session                          Return session
+  (found / outfit / fit_card)             (error message to user)
+```
+
+**State legend** — everything above reads from and writes to one `session` dict:
+`query → parsed → search_results → selected_item → outfit_suggestion → fit_card`, with `error` short-circuiting the loop at any point.
 ---
 
 ## AI Tool Plan
@@ -135,6 +203,8 @@ For each tool, describe the specific failure mode you're handling and what the a
      "I'll give Claude my Tool 1 spec (inputs, return value, failure mode) and ask it to implement
      search_listings() using load_listings() from the data loader — then test it against 3 queries
      before trusting it" is a plan. -->
+
+For all code generation, I plan to use Claude Code to help generate my code. I'll make sure to refer to the relevant part of this document, and also have it generate tests and example output so that I can verfiy its work before moving on. For each test, I'll instruct it to go over edge cases, like if search_listings() finds no relevant matches.
 
 **Milestone 3 — Individual tool implementations:**
 
